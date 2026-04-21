@@ -77,6 +77,9 @@ func (p DockerTagPather) BlobPath(name string) (string, error) {
 	if len(tag) == 0 {
 		return "", errors.New("tag must be non-empty")
 	}
+	if strings.Contains(tag, ":") {
+		return "", errors.New("name must be in format 'repo:tag'")
+	}
 	return path.Join(p.BasePath(), repo, "_manifests/tags", tag, "current/link"), nil
 }
 
@@ -90,7 +93,7 @@ func (p DockerTagPather) NameFromBlobPath(bp string) (string, error) {
 
 	// rest should be: <repo>/_manifests/tags/<tag>/current/link
 	const manifestsTag = "/_manifests/tags/"
-	idx := strings.Index(rest, manifestsTag)
+	idx := strings.LastIndex(rest, manifestsTag)
 	if idx < 0 {
 		return "", errors.New("invalid docker tag path format")
 	}
