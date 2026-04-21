@@ -81,10 +81,11 @@ func (r *FileReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-// WriteTo implements io.WriterTo. This allows io.Copy to use a
-// pooled buffer instead of allocating a new 32KB buffer for every
-// piece transfer, eliminating the dominant allocation in the
-// torrent data pipeline.
+// WriteTo implements io.WriterTo. This copies using a pooled
+// buffer via an explicit read/write loop. We avoid io.Copy and
+// io.CopyBuffer here because they check for ReadFrom on the
+// destination, which for *net.TCPConn triggers sendFile and
+// allocates internally, defeating the pooled buffer.
 func (r *FileReader) WriteTo(w io.Writer) (int64, error) {
 	if err := r.init(); err != nil {
 		return 0, err
@@ -92,7 +93,29 @@ func (r *FileReader) WriteTo(w io.Writer) (int64, error) {
 	bp := copyBufPool.Get().(*[]byte)
 	buf := *bp
 	defer copyBufPool.Put(bp)
-	return io.CopyBuffer(w, r.reader, buf)
+	var written int64
+	for {
+		nr, er := r.reader.Read(buf)
+		if nr > 0 {
+			nw, ew := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				return written, er
+			}
+			break
+		}
+	}
+	return written, nil
 }
 
 // Close closes the underlying file.
