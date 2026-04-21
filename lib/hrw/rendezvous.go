@@ -51,22 +51,18 @@ type RendezvousHash struct {
 	MaxHashValue []byte
 }
 
-// RendezvousNodesByScore is a predicat that supports sorting by score(key).
-type RendezvousNodesByScore struct {
-	key   string
-	nodes []*RendezvousHashNode
+// nodeScore pairs a node with its pre-computed score.
+type nodeScore struct {
+	node  *RendezvousHashNode
+	score float64
 }
 
-// Len return length.
-func (a RendezvousNodesByScore) Len() int { return len(a.nodes) }
+// nodeScoreSlice supports sorting by pre-computed score.
+type nodeScoreSlice []nodeScore
 
-// Swap swaps two elements.
-func (a RendezvousNodesByScore) Swap(i, j int) { a.nodes[i], a.nodes[j] = a.nodes[j], a.nodes[i] }
-
-// Less is a predicate '<' for a set.
-func (a RendezvousNodesByScore) Less(i, j int) bool {
-	return a.nodes[i].Score(a.key) < a.nodes[j].Score(a.key)
-}
+func (s nodeScoreSlice) Len() int            { return len(s) }
+func (s nodeScoreSlice) Swap(i, j int)       { s[i], s[j] = s[j], s[i] }
+func (s nodeScoreSlice) Less(i, j int) bool  { return s[i].score > s[j].score }
 
 // NewRendezvousHash constructs and prepopulates a RendezvousHash object.
 func NewRendezvousHash(hashFactory HashFactory, scoreFunc UIntToFloat) *RendezvousHash {
@@ -196,13 +192,21 @@ func (rh *RendezvousHash) GetNode(name string) (*RendezvousHashNode, int) {
 // score(Node1) > score(N2) > ... score(NodeN).
 // Number of returned nodes = min(N, len(nodes)).
 func (rh *RendezvousHash) GetOrderedNodes(key string, n int) []*RendezvousHashNode {
-	nodes := make([]*RendezvousHashNode, len(rh.Nodes))
-	copy(nodes, rh.Nodes)
-
-	sort.Sort(sort.Reverse(&RendezvousNodesByScore{key: key, nodes: nodes}))
-
-	if n >= len(nodes) {
-		return nodes
+	// Pre-compute scores once (O(n)) instead of recomputing
+	// on every sort comparison (O(n log n) calls to Score).
+	scored := make(nodeScoreSlice, len(rh.Nodes))
+	for i, node := range rh.Nodes {
+		scored[i] = nodeScore{node: node, score: node.Score(key)}
 	}
-	return nodes[:n]
+
+	sort.Sort(scored)
+
+	if n >= len(scored) {
+		n = len(scored)
+	}
+	result := make([]*RendezvousHashNode, n)
+	for i := 0; i < n; i++ {
+		result[i] = scored[i].node
+	}
+	return result
 }
