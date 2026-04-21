@@ -62,6 +62,11 @@ type Conn struct {
 	stats         tally.Scope
 	networkEvents networkevent.Producer
 
+	// Pre-computed tagged counters for bandwidth tracking.
+	// Avoids allocating map[string]string on every piece transfer.
+	egressCounter  tally.Counter
+	ingressCounter tally.Counter
+
 	// Marks whether the connection was opened by the remote peer, or the local peer.
 	openedByRemote bool
 
@@ -112,6 +117,12 @@ func newConn(
 		clk:            clk,
 		stats:          stats,
 		networkEvents:  networkEvents,
+		egressCounter: stats.Tagged(map[string]string{
+			"piece_bandwidth_direction": "egress",
+		}).Counter("piece_bandwidth"),
+		ingressCounter: stats.Tagged(map[string]string{
+			"piece_bandwidth_direction": "ingress",
+		}).Counter("piece_bandwidth"),
 		openedByRemote: openedByRemote,
 		sender:         make(chan *Message, config.SenderBufferSize),
 		receiver:       make(chan *Message, config.ReceiverBufferSize),
@@ -208,7 +219,7 @@ func (c *Conn) readPayload(length int32) ([]byte, error) {
 	if _, err := io.ReadFull(c.nc, payload); err != nil {
 		return nil, err
 	}
-	c.countBandwidth("ingress", int64(8*length))
+	c.countIngressBandwidth(int64(8 * length))
 	return payload, nil
 }
 
@@ -268,7 +279,7 @@ func (c *Conn) sendPiecePayload(pr storage.PieceReader) error {
 	if err != nil {
 		return fmt.Errorf("copy to socket: %s", err)
 	}
-	c.countBandwidth("egress", 8*n)
+	c.countEgressBandwidth(8 * n)
 	return nil
 }
 
@@ -307,10 +318,12 @@ func (c *Conn) writeLoop() {
 	}
 }
 
-func (c *Conn) countBandwidth(direction string, n int64) {
-	c.stats.Tagged(map[string]string{
-		"piece_bandwidth_direction": direction,
-	}).Counter("piece_bandwidth").Inc(n)
+func (c *Conn) countEgressBandwidth(n int64) {
+	c.egressCounter.Inc(n)
+}
+
+func (c *Conn) countIngressBandwidth(n int64) {
+	c.ingressCounter.Inc(n)
 }
 
 func (c *Conn) log(keysAndValues ...interface{}) *zap.SugaredLogger {
