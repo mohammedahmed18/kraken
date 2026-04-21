@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"regexp"
 	"strings"
 )
 
@@ -68,31 +67,49 @@ func (p DockerTagPather) BasePath() string {
 
 // BlobPath interprets name as a "repo:tag" and generates a registry path for it.
 func (p DockerTagPather) BlobPath(name string) (string, error) {
-	tokens := strings.Split(name, ":")
-	if len(tokens) != 2 {
+	repo, tag, ok := strings.Cut(name, ":")
+	if !ok {
 		return "", errors.New("name must be in format 'repo:tag'")
 	}
-	repo := tokens[0]
 	if len(repo) == 0 {
 		return "", errors.New("repo must be non-empty")
 	}
-	tag := tokens[1]
 	if len(tag) == 0 {
 		return "", errors.New("tag must be non-empty")
+	}
+	if strings.Contains(tag, ":") {
+		return "", errors.New("name must be in format 'repo:tag'")
 	}
 	return path.Join(p.BasePath(), repo, "_manifests/tags", tag, "current/link"), nil
 }
 
 // NameFromBlobPath converts a tag path back into repo:tag format.
 func (p DockerTagPather) NameFromBlobPath(bp string) (string, error) {
-	re := regexp.MustCompile(p.BasePath() + "/(.+)/_manifests/tags/(.+)/current/link")
-	matches := re.FindStringSubmatch(bp)
-	if len(matches) != 3 {
+	base := p.BasePath() + "/"
+	if !strings.HasPrefix(bp, base) {
 		return "", errors.New("invalid docker tag path format")
 	}
-	repo := matches[1]
-	tag := matches[2]
-	return fmt.Sprintf("%s:%s", repo, tag), nil
+	rest := bp[len(base):]
+
+	// rest should be: <repo>/_manifests/tags/<tag>/current/link
+	const manifestsTag = "/_manifests/tags/"
+	idx := strings.LastIndex(rest, manifestsTag)
+	if idx < 0 {
+		return "", errors.New("invalid docker tag path format")
+	}
+	repo := rest[:idx]
+
+	afterTag := rest[idx+len(manifestsTag):]
+	const currentLink = "/current/link"
+	if !strings.HasSuffix(afterTag, currentLink) {
+		return "", errors.New("invalid docker tag path format")
+	}
+	tag := afterTag[:len(afterTag)-len(currentLink)]
+
+	if repo == "" || tag == "" {
+		return "", errors.New("invalid docker tag path format")
+	}
+	return repo + ":" + tag, nil
 }
 
 // ShardedDockerBlobPather generates sharded paths for Docker blobs.
@@ -116,12 +133,28 @@ func (p ShardedDockerBlobPather) BlobPath(name string) (string, error) {
 
 // NameFromBlobPath converts a sharded blob path back into raw hex format.
 func (p ShardedDockerBlobPather) NameFromBlobPath(bp string) (string, error) {
-	re := regexp.MustCompile(p.BasePath() + "/sha256/../(.+)/data")
-	matches := re.FindStringSubmatch(bp)
-	if len(matches) != 2 {
+	// Expected format: <basePath>/sha256/<2-char-shard>/<name>/data
+	prefix := p.BasePath() + "/sha256/"
+	if !strings.HasPrefix(bp, prefix) {
 		return "", errors.New("invalid sharded docker blob path format")
 	}
-	return matches[1], nil
+	rest := bp[len(prefix):]
+
+	// Skip the 2-character shard and slash: "xx/<name>/data"
+	if len(rest) < 3 || rest[2] != '/' {
+		return "", errors.New("invalid sharded docker blob path format")
+	}
+	rest = rest[3:] // "<name>/data"
+
+	const dataSuffix = "/data"
+	if !strings.HasSuffix(rest, dataSuffix) {
+		return "", errors.New("invalid sharded docker blob path format")
+	}
+	name := rest[:len(rest)-len(dataSuffix)]
+	if name == "" {
+		return "", errors.New("invalid sharded docker blob path format")
+	}
+	return name, nil
 }
 
 // IdentityPather is the identity Pather.

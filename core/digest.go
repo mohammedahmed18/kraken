@@ -16,7 +16,6 @@ package core
 import (
 	_ "crypto/sha256" // For computing digest.
 	"database/sql/driver"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,7 +62,7 @@ func NewSHA256DigestFromHex(hex string) (Digest, error) {
 	return Digest{
 		algo: SHA256,
 		hex:  hex,
-		raw:  fmt.Sprintf("%s:%s", SHA256, hex),
+		raw:  SHA256 + ":" + hex,
 	}, nil
 }
 
@@ -73,12 +72,10 @@ func ParseSHA256Digest(raw string) (Digest, error) {
 	if raw == "" {
 		return Digest{}, errors.New("invalid digest: empty")
 	}
-	parts := strings.Split(raw, ":")
-	if len(parts) != 2 {
+	algo, hex, ok := strings.Cut(raw, ":")
+	if !ok {
 		return Digest{}, errors.New("invalid digest: expected '<algo>:<hex>'")
 	}
-	algo := parts[0]
-	hex := parts[1]
 	if algo != SHA256 {
 		return Digest{}, errors.New("invalid digest algo: expected sha256")
 	}
@@ -160,8 +157,11 @@ func ValidateSHA256(s string) error {
 	if len(s) != 64 {
 		return fmt.Errorf("expected 64 characters, got %d from %q", len(s), s)
 	}
-	if _, err := hex.DecodeString(s); err != nil {
-		return fmt.Errorf("hex: %s", err)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return fmt.Errorf("hex: invalid byte %d (%c) in hex string", c, c)
+		}
 	}
 	return nil
 }

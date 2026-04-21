@@ -51,22 +51,18 @@ type RendezvousHash struct {
 	MaxHashValue []byte
 }
 
-// RendezvousNodesByScore is a predicat that supports sorting by score(key).
-type RendezvousNodesByScore struct {
-	key   string
-	nodes []*RendezvousHashNode
+// nodeScore pairs a node with its pre-computed score.
+type nodeScore struct {
+	node  *RendezvousHashNode
+	score float64
 }
 
-// Len return length.
-func (a RendezvousNodesByScore) Len() int { return len(a.nodes) }
+// nodeScoreSlice supports sorting by pre-computed score.
+type nodeScoreSlice []nodeScore
 
-// Swap swaps two elements.
-func (a RendezvousNodesByScore) Swap(i, j int) { a.nodes[i], a.nodes[j] = a.nodes[j], a.nodes[i] }
-
-// Less is a predicate '<' for a set.
-func (a RendezvousNodesByScore) Less(i, j int) bool {
-	return a.nodes[i].Score(a.key) < a.nodes[j].Score(a.key)
-}
+func (s nodeScoreSlice) Len() int            { return len(s) }
+func (s nodeScoreSlice) Swap(i, j int)       { s[i], s[j] = s[j], s[i] }
+func (s nodeScoreSlice) Less(i, j int) bool  { return s[i].score > s[j].score }
 
 // NewRendezvousHash constructs and prepopulates a RendezvousHash object.
 func NewRendezvousHash(hashFactory HashFactory, scoreFunc UIntToFloat) *RendezvousHash {
@@ -141,17 +137,24 @@ func BigIntToFloat64(bytesUInt []byte, maxValue []byte, hasher hash.Hash) float6
 // Rendezvous Hash. It's using big golang float key as hexidemical encoding of
 // a byte array.
 func (rhn *RendezvousHashNode) Score(key string) float64 {
-	hasher := rhn.RHash.Hash()
-
 	keyBytes, err := hex.DecodeString(key)
 	if err != nil {
 		return math.NaN()
 	}
+	return rhn.scoreWithKeyBytes(keyBytes)
+}
 
-	// Add node's seed to a key string
-	hashBytes := append(keyBytes, []byte(rhn.Label)...)
+// scoreWithKeyBytes computes the score using pre-decoded key bytes.
+// This avoids redundant hex decoding when scoring the same key
+// against multiple nodes.
+func (rhn *RendezvousHashNode) scoreWithKeyBytes(keyBytes []byte) float64 {
+	hasher := rhn.RHash.Hash()
 
-	hasher.Write(hashBytes)
+	// Write key and label directly into hasher to avoid
+	// allocating a concatenated slice.
+	hasher.Write(keyBytes)
+	hasher.Write([]byte(rhn.Label))
+
 	score := rhn.RHash.ScoreFunc(hasher.Sum(nil), rhn.RHash.MaxHashValue, hasher)
 
 	// for more information on this math please look at this paper:
@@ -196,13 +199,30 @@ func (rh *RendezvousHash) GetNode(name string) (*RendezvousHashNode, int) {
 // score(Node1) > score(N2) > ... score(NodeN).
 // Number of returned nodes = min(N, len(nodes)).
 func (rh *RendezvousHash) GetOrderedNodes(key string, n int) []*RendezvousHashNode {
-	nodes := make([]*RendezvousHashNode, len(rh.Nodes))
-	copy(nodes, rh.Nodes)
-
-	sort.Sort(sort.Reverse(&RendezvousNodesByScore{key: key, nodes: nodes}))
-
-	if n >= len(nodes) {
-		return nodes
+	// Decode the hex key once and reuse for all nodes.
+	keyBytes, err := hex.DecodeString(key)
+	if err != nil {
+		return nil
 	}
-	return nodes[:n]
+
+	// Pre-compute scores once (O(n)) instead of recomputing
+	// on every sort comparison (O(n log n) calls to Score).
+	scored := make(nodeScoreSlice, len(rh.Nodes))
+	for i, node := range rh.Nodes {
+		scored[i] = nodeScore{
+			node:  node,
+			score: node.scoreWithKeyBytes(keyBytes),
+		}
+	}
+
+	sort.Sort(scored)
+
+	if n >= len(scored) {
+		n = len(scored)
+	}
+	result := make([]*RendezvousHashNode, n)
+	for i := 0; i < n; i++ {
+		result[i] = scored[i].node
+	}
+	return result
 }
