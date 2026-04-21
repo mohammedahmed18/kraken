@@ -18,12 +18,24 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/uber/kraken/gen/go/proto/p2p"
 	"github.com/uber/kraken/lib/torrent/storage"
 )
+
+// msgBufPool pools buffers for proto-marshalled messages.
+// Messages are limited to maxMessageSize (32KB), so we pool
+// buffers of that capacity to avoid per-message allocations.
+var msgBufPool = sync.Pool{
+	New: func() interface{} {
+		// 4 bytes for length prefix + maxMessageSize for data.
+		b := make([]byte, 0, 4+maxMessageSize)
+		return &b
+	},
+}
 
 // Message joins a protobuf message with an optional payload. The only p2p.Message
 // type which should include a payload is PiecePayloadMessage.
@@ -101,16 +113,29 @@ func sendMessage(nc net.Conn, msg *p2p.Message) error {
 	if err != nil {
 		return fmt.Errorf("proto marshal: %s", err)
 	}
-	if err := binary.Write(nc, binary.BigEndian, uint32(len(data))); err != nil {
-		return fmt.Errorf("write data length: %s", err)
+
+	// Combine length prefix + data into a single buffer to reduce
+	// the write path from 2 syscalls to 1.
+	bp := msgBufPool.Get().(*[]byte)
+	buf := *bp
+	needed := 4 + len(data)
+	if cap(buf) < needed {
+		buf = make([]byte, needed)
+	} else {
+		buf = buf[:needed]
 	}
-	for len(data) > 0 {
-		n, err := nc.Write(data)
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(data)))
+	copy(buf[4:], data)
+
+	for len(buf) > 0 {
+		n, err := nc.Write(buf)
 		if err != nil {
+			msgBufPool.Put(bp)
 			return fmt.Errorf("write data: %s", err)
 		}
-		data = data[n:]
+		buf = buf[n:]
 	}
+	msgBufPool.Put(bp)
 	return nil
 }
 
@@ -132,14 +157,26 @@ func readMessage(nc net.Conn) (*p2p.Message, error) {
 	if uint64(dataLen) > maxMessageSize {
 		return nil, fmt.Errorf("message exceeds max size: %d > %d", dataLen, maxMessageSize)
 	}
-	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(nc, data); err != nil {
+
+	// Use pooled buffer to avoid allocating per-message.
+	bp := msgBufPool.Get().(*[]byte)
+	buf := *bp
+	if uint32(cap(buf)) < dataLen {
+		buf = make([]byte, dataLen)
+	} else {
+		buf = buf[:dataLen]
+	}
+
+	if _, err := io.ReadFull(nc, buf); err != nil {
+		msgBufPool.Put(bp)
 		return nil, fmt.Errorf("read data: %s", err)
 	}
 	p2pMessage := new(p2p.Message)
-	if err := proto.Unmarshal(data, p2pMessage); err != nil {
+	if err := proto.Unmarshal(buf, p2pMessage); err != nil {
+		msgBufPool.Put(bp)
 		return nil, fmt.Errorf("proto unmarshal: %s", err)
 	}
+	msgBufPool.Put(bp)
 	return p2pMessage, nil
 }
 
