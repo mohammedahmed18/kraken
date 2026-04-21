@@ -137,17 +137,24 @@ func BigIntToFloat64(bytesUInt []byte, maxValue []byte, hasher hash.Hash) float6
 // Rendezvous Hash. It's using big golang float key as hexidemical encoding of
 // a byte array.
 func (rhn *RendezvousHashNode) Score(key string) float64 {
-	hasher := rhn.RHash.Hash()
-
 	keyBytes, err := hex.DecodeString(key)
 	if err != nil {
 		return math.NaN()
 	}
+	return rhn.scoreWithKeyBytes(keyBytes)
+}
 
-	// Add node's seed to a key string
-	hashBytes := append(keyBytes, []byte(rhn.Label)...)
+// scoreWithKeyBytes computes the score using pre-decoded key bytes.
+// This avoids redundant hex decoding when scoring the same key
+// against multiple nodes.
+func (rhn *RendezvousHashNode) scoreWithKeyBytes(keyBytes []byte) float64 {
+	hasher := rhn.RHash.Hash()
 
-	hasher.Write(hashBytes)
+	// Write key and label directly into hasher to avoid
+	// allocating a concatenated slice.
+	hasher.Write(keyBytes)
+	hasher.Write([]byte(rhn.Label))
+
 	score := rhn.RHash.ScoreFunc(hasher.Sum(nil), rhn.RHash.MaxHashValue, hasher)
 
 	// for more information on this math please look at this paper:
@@ -192,11 +199,20 @@ func (rh *RendezvousHash) GetNode(name string) (*RendezvousHashNode, int) {
 // score(Node1) > score(N2) > ... score(NodeN).
 // Number of returned nodes = min(N, len(nodes)).
 func (rh *RendezvousHash) GetOrderedNodes(key string, n int) []*RendezvousHashNode {
+	// Decode the hex key once and reuse for all nodes.
+	keyBytes, err := hex.DecodeString(key)
+	if err != nil {
+		return nil
+	}
+
 	// Pre-compute scores once (O(n)) instead of recomputing
 	// on every sort comparison (O(n log n) calls to Score).
 	scored := make(nodeScoreSlice, len(rh.Nodes))
 	for i, node := range rh.Nodes {
-		scored[i] = nodeScore{node: node, score: node.Score(key)}
+		scored[i] = nodeScore{
+			node:  node,
+			score: node.scoreWithKeyBytes(keyBytes),
+		}
 	}
 
 	sort.Sort(scored)
