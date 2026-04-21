@@ -15,27 +15,35 @@
 package cache
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
 
+// lruEntry stores the key and expiration for a cache entry.
+type lruEntry struct {
+	key       string
+	expireAt  time.Time
+}
+
 // LRUCache provides a simple LRU cache with both size and TTL limits.
 // It uses RWMutex for optimal concurrent access patterns - multiple
 // concurrent reads are allowed while writes get exclusive access.
+// Internally it uses a doubly-linked list for O(1) LRU operations.
 type LRUCache struct {
-	mu       sync.RWMutex
-	config   LRUCacheConfig
-	entries  map[string]time.Time // key -> expiration time
-	lruOrder []string             // keys in LRU order (oldest first)
+	mu      sync.RWMutex
+	config  LRUCacheConfig
+	items   map[string]*list.Element // key -> list element
+	order   *list.List               // front = oldest, back = newest
 }
 
 // NewLRUCache creates a new LRU cache from the provided configuration.
 func NewLRUCache(cfg LRUCacheConfig) *LRUCache {
 	cfg = cfg.applyDefaults()
 	return &LRUCache{
-		config:   cfg,
-		entries:  make(map[string]time.Time),
-		lruOrder: make([]string, 0, cfg.Size),
+		config: cfg,
+		items:  make(map[string]*list.Element, cfg.Size),
+		order:  list.New(),
 	}
 }
 
@@ -45,16 +53,18 @@ func (c *LRUCache) Has(key string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	expireTime, exists := c.entries[key]
-	if !exists || time.Now().After(expireTime) {
+	elem, exists := c.items[key]
+	if !exists {
 		return false
 	}
-	return true
+	return time.Now().Before(elem.Value.(*lruEntry).expireAt)
 }
 
-// Add marks a key as cached. This operation uses a write lock for exclusive access.
-// If the key already exists, its expiration time is updated and it's moved to the
-// end of the LRU order. If the cache exceeds config.Size, oldest entries are evicted.
+// Add marks a key as cached. This operation uses a write lock
+// for exclusive access. If the key already exists, its expiration
+// time is updated and it is moved to the back (most-recent) of
+// the LRU order. If the cache exceeds config.Size, oldest entries
+// are evicted.
 func (c *LRUCache) Add(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -62,19 +72,20 @@ func (c *LRUCache) Add(key string) {
 	now := time.Now()
 	expireTime := now.Add(c.config.TTL)
 
-	// If key already exists, update expiration and move to end
-	if _, exists := c.entries[key]; exists {
-		c.entries[key] = expireTime
-		c.moveToEnd(key)
+	// If key already exists, update expiration and move to back.
+	if elem, exists := c.items[key]; exists {
+		elem.Value.(*lruEntry).expireAt = expireTime
+		c.order.MoveToBack(elem)
 		return
 	}
 
-	// Add new entry
-	c.entries[key] = expireTime
-	c.lruOrder = append(c.lruOrder, key)
+	// Add new entry at the back (most-recent).
+	entry := &lruEntry{key: key, expireAt: expireTime}
+	elem := c.order.PushBack(entry)
+	c.items[key] = elem
 
-	// Evict expired and oldest entries if needed
-	c.evict()
+	// Evict expired and oldest entries if needed.
+	c.evict(now)
 }
 
 // Delete removes a key from the cache.
@@ -82,24 +93,19 @@ func (c *LRUCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.entries[key]; !exists {
+	elem, exists := c.items[key]
+	if !exists {
 		return
 	}
-
-	delete(c.entries, key)
-	for i, k := range c.lruOrder {
-		if k == key {
-			c.lruOrder = append(c.lruOrder[:i], c.lruOrder[i+1:]...)
-			break
-		}
-	}
+	c.order.Remove(elem)
+	delete(c.items, key)
 }
 
 // Size returns the current number of entries in the cache.
 func (c *LRUCache) Size() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return len(c.entries)
+	return len(c.items)
 }
 
 // Clear removes all entries from the cache.
@@ -107,42 +113,29 @@ func (c *LRUCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = make(map[string]time.Time)
-	c.lruOrder = c.lruOrder[:0]
+	c.items = make(map[string]*list.Element, c.config.Size)
+	c.order.Init()
 }
 
 // evict removes expired entries and enforces size limit.
-// This method assumes the caller already holds a write lock.
-func (c *LRUCache) evict() {
-	now := time.Now()
-
-	// Remove expired entries
-	i := 0
-	for i < len(c.lruOrder) {
-		key := c.lruOrder[i]
-		if expireTime, exists := c.entries[key]; !exists || now.After(expireTime) {
-			delete(c.entries, key)
-			c.lruOrder = append(c.lruOrder[:i], c.lruOrder[i+1:]...)
-		} else {
-			i++
-		}
-	}
-
-	// Enforce size limit by removing oldest entries
-	for len(c.entries) > c.config.Size {
-		oldest := c.lruOrder[0]
-		delete(c.entries, oldest)
-		c.lruOrder = c.lruOrder[1:]
-	}
-}
-
-// moveToEnd moves key to end of LRU order.
-// This method assumes the caller already holds a write lock.
-func (c *LRUCache) moveToEnd(key string) {
-	for i, k := range c.lruOrder {
-		if k == key {
-			c.lruOrder = append(append(c.lruOrder[:i], c.lruOrder[i+1:]...), key)
+// Caller must hold the write lock.
+func (c *LRUCache) evict(now time.Time) {
+	// Remove expired entries from the front (oldest first).
+	for c.order.Len() > 0 {
+		front := c.order.Front()
+		entry := front.Value.(*lruEntry)
+		if now.Before(entry.expireAt) {
 			break
 		}
+		c.order.Remove(front)
+		delete(c.items, entry.key)
+	}
+
+	// Enforce size limit by removing oldest entries.
+	for c.order.Len() > c.config.Size {
+		front := c.order.Front()
+		entry := front.Value.(*lruEntry)
+		c.order.Remove(front)
+		delete(c.items, entry.key)
 	}
 }
