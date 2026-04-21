@@ -14,6 +14,7 @@
 package dispatch
 
 import (
+	"io"
 	"sync"
 	"time"
 
@@ -59,6 +60,17 @@ func (w *pieceReaderCloseWatcher) Close() error {
 		w.w.touchLastRead()
 	}
 	return err
+}
+
+// WriteTo delegates to the underlying PieceReader if it
+// implements io.WriterTo. Without this, the wrapper hides
+// the WriterTo interface, forcing io.Copy to fall back to
+// ReadFrom which allocates a 32KB buffer per transfer.
+func (w *pieceReaderCloseWatcher) WriteTo(dst io.Writer) (int64, error) {
+	if wt, ok := w.PieceReader.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	return io.Copy(dst, w.PieceReader)
 }
 
 func (w *torrentAccessWatcher) GetPieceReader(piece int) (storage.PieceReader, error) {
