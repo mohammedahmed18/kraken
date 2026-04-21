@@ -13,7 +13,10 @@
 // limitations under the License.
 package piecereader
 
-import "bytes"
+import (
+	"bytes"
+	"io"
+)
 
 // Buffer is a storage.PieceReader which reads a piece from an in-memory buffer.
 type Buffer struct {
@@ -28,6 +31,12 @@ func NewBuffer(b []byte) *Buffer {
 // Read reads a piece into p.
 func (b *Buffer) Read(p []byte) (int, error) {
 	return b.reader.Read(p)
+}
+
+// WriteTo implements io.WriterTo. This allows io.Copy to avoid
+// allocating an intermediate buffer when copying piece data.
+func (b *Buffer) WriteTo(w io.Writer) (int64, error) {
+	return b.reader.WriteTo(w)
 }
 
 // Close noops.
