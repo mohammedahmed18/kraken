@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/uber/kraken/core"
 	"github.com/uber/kraken/lib/store"
@@ -29,6 +30,16 @@ import (
 	"github.com/willf/bitset"
 	"go.uber.org/atomic"
 )
+
+// writeBufPool is a pool of 32KB buffers used by writePiece
+// to avoid allocating a new buffer for every io.Copy call
+// during piece writes.
+var writeBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
 
 var (
 	errPieceNotComplete   = errors.New("piece not complete")
@@ -186,9 +197,13 @@ func (t *Torrent) writePiece(src storage.PieceReader, pi int) error {
 	if _, err := f.Seek(t.getFileOffset(pi), 0); err != nil {
 		return fmt.Errorf("seek: %s", err)
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	bp := writeBufPool.Get().(*[]byte)
+	buf := *bp
+	if _, err := io.CopyBuffer(f, r, buf); err != nil {
+		writeBufPool.Put(bp)
 		return fmt.Errorf("copy: %s", err)
 	}
+	writeBufPool.Put(bp)
 	if h.Sum32() != t.metaInfo.GetPieceSum(pi) {
 		return errors.New("invalid piece sum")
 	}

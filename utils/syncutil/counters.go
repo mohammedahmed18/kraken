@@ -13,16 +13,16 @@
 // limitations under the License.
 package syncutil
 
-import "sync"
+import "sync/atomic"
 
-// counter is an element in a Counters struct, wrapping a count and its lock.
+// counter is an element in a Counters struct, using atomic operations
+// for lock-free concurrent access.
 type counter struct {
-	mu    sync.RWMutex
-	count int
+	count atomic.Int64
 }
 
 // Counters provides a wrapper to a list of counters that supports
-// concurrent update-only operations.
+// concurrent update-only operations using lock-free atomics.
 type Counters []counter
 
 // NewCounters returns an initialized Counters of the given length.
@@ -37,32 +37,20 @@ func (c Counters) Len() int {
 
 // Get returns the count of the counter at index i.
 func (c Counters) Get(i int) int {
-	c[i].mu.RLock()
-	defer c[i].mu.RUnlock()
-
-	return c[i].count
+	return int(c[i].count.Load())
 }
 
 // Set sets the count of the counter at index i to count v.
 func (c Counters) Set(i, v int) {
-	c[i].mu.Lock()
-	defer c[i].mu.Unlock()
-
-	c[i].count = v
+	c[i].count.Store(int64(v))
 }
 
 // Increment increments the count of the counter at index i.
 func (c Counters) Increment(i int) {
-	c[i].mu.Lock()
-	defer c[i].mu.Unlock()
-
-	c[i].count++
+	c[i].count.Add(1)
 }
 
 // Decrement decrements the count of the counter at index i.
 func (c Counters) Decrement(i int) {
-	c[i].mu.Lock()
-	defer c[i].mu.Unlock()
-
-	c[i].count--
+	c[i].count.Add(-1)
 }

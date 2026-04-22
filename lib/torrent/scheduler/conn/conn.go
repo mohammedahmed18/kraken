@@ -62,6 +62,11 @@ type Conn struct {
 	stats         tally.Scope
 	networkEvents networkevent.Producer
 
+	// Pre-computed tagged counters for bandwidth tracking.
+	// Avoids allocating map[string]string on every piece transfer.
+	egressCounter  tally.Counter
+	ingressCounter tally.Counter
+
 	// Marks whether the connection was opened by the remote peer, or the local peer.
 	openedByRemote bool
 
@@ -112,6 +117,12 @@ func newConn(
 		clk:            clk,
 		stats:          stats,
 		networkEvents:  networkEvents,
+		egressCounter: stats.Tagged(map[string]string{
+			"piece_bandwidth_direction": "egress",
+		}).Counter("piece_bandwidth"),
+		ingressCounter: stats.Tagged(map[string]string{
+			"piece_bandwidth_direction": "ingress",
+		}).Counter("piece_bandwidth"),
 		openedByRemote: openedByRemote,
 		sender:         make(chan *Message, config.SenderBufferSize),
 		receiver:       make(chan *Message, config.ReceiverBufferSize),
@@ -199,17 +210,19 @@ func (c *Conn) IsClosed() bool {
 	return c.closed.Load()
 }
 
-func (c *Conn) readPayload(length int32) ([]byte, error) {
+func (c *Conn) readPayloadPooled(length int32) (*piecereader.PooledBuffer, error) {
 	if err := c.bandwidth.ReserveIngress(int64(length)); err != nil {
 		c.log().Errorf("Error reserving ingress bandwidth for piece payload: %s", err)
 		return nil, fmt.Errorf("ingress bandwidth: %s", err)
 	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.nc, payload); err != nil {
+	pb := piecereader.NewPooledBuffer(int(length))
+	if _, err := io.ReadFull(c.nc, pb.Bytes()); err != nil {
+		pb.Close()
 		return nil, err
 	}
-	c.countBandwidth("ingress", int64(8*length))
-	return payload, nil
+	pb.Reset()
+	c.countIngressBandwidth(int64(8 * length))
+	return pb, nil
 }
 
 func (c *Conn) readMessage() (*Message, error) {
@@ -221,12 +234,11 @@ func (c *Conn) readMessage() (*Message, error) {
 	if p2pMessage.Type == p2p.Message_PIECE_PAYLOAD {
 		// For payload messages, we must read the actual payload to the connection
 		// after reading the message.
-		payload, err := c.readPayload(p2pMessage.PiecePayload.Length)
+		pb, err := c.readPayloadPooled(p2pMessage.PiecePayload.Length)
 		if err != nil {
 			return nil, fmt.Errorf("read payload: %s", err)
 		}
-		// TODO(codyg): Consider making this reader read directly from the socket.
-		pr = piecereader.NewBuffer(payload)
+		pr = pb
 	}
 
 	return &Message{p2pMessage, pr}, nil
@@ -268,7 +280,7 @@ func (c *Conn) sendPiecePayload(pr storage.PieceReader) error {
 	if err != nil {
 		return fmt.Errorf("copy to socket: %s", err)
 	}
-	c.countBandwidth("egress", 8*n)
+	c.countEgressBandwidth(8 * n)
 	return nil
 }
 
@@ -307,10 +319,12 @@ func (c *Conn) writeLoop() {
 	}
 }
 
-func (c *Conn) countBandwidth(direction string, n int64) {
-	c.stats.Tagged(map[string]string{
-		"piece_bandwidth_direction": direction,
-	}).Counter("piece_bandwidth").Inc(n)
+func (c *Conn) countEgressBandwidth(n int64) {
+	c.egressCounter.Inc(n)
+}
+
+func (c *Conn) countIngressBandwidth(n int64) {
+	c.ingressCounter.Inc(n)
 }
 
 func (c *Conn) log(keysAndValues ...interface{}) *zap.SugaredLogger {

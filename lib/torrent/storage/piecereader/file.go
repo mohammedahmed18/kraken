@@ -16,9 +16,20 @@ package piecereader
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/uber/kraken/lib/store"
 )
+
+// copyBufPool is a pool of 32KB buffers used by FileReader.WriteTo
+// to avoid allocating a new buffer for every io.Copy call during
+// piece transfers.
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
 
 // Opener opens files.
 type Opener interface {
@@ -45,20 +56,66 @@ func NewFileReader(offset, length int64, opener Opener) *FileReader {
 	}
 }
 
+// init lazily opens the file and prepares the reader.
+func (r *FileReader) init() error {
+	if r.reader != nil {
+		return nil
+	}
+	f, err := r.opener.Open()
+	if err != nil {
+		return fmt.Errorf("open: %s", err)
+	}
+	if _, err := f.Seek(r.offset, io.SeekStart); err != nil {
+		return fmt.Errorf("seek: %s", err)
+	}
+	r.reader = io.LimitReader(f, r.length)
+	r.closer = f
+	return nil
+}
+
 // Read reads a piece in p.
 func (r *FileReader) Read(p []byte) (int, error) {
-	if r.reader == nil {
-		f, err := r.opener.Open()
-		if err != nil {
-			return 0, fmt.Errorf("open: %s", err)
-		}
-		if _, err := f.Seek(r.offset, io.SeekStart); err != nil {
-			return 0, fmt.Errorf("seek: %s", err)
-		}
-		r.reader = io.LimitReader(f, r.length)
-		r.closer = f
+	if err := r.init(); err != nil {
+		return 0, err
 	}
 	return r.reader.Read(p)
+}
+
+// WriteTo implements io.WriterTo. This copies using a pooled
+// buffer via an explicit read/write loop. We avoid io.Copy and
+// io.CopyBuffer here because they check for ReadFrom on the
+// destination, which for *net.TCPConn triggers sendFile and
+// allocates internally, defeating the pooled buffer.
+func (r *FileReader) WriteTo(w io.Writer) (int64, error) {
+	if err := r.init(); err != nil {
+		return 0, err
+	}
+	bp := copyBufPool.Get().(*[]byte)
+	buf := *bp
+	defer copyBufPool.Put(bp)
+	var written int64
+	for {
+		nr, er := r.reader.Read(buf)
+		if nr > 0 {
+			nw, ew := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				return written, er
+			}
+			break
+		}
+	}
+	return written, nil
 }
 
 // Close closes the underlying file.
