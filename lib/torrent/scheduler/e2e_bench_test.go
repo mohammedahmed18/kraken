@@ -29,6 +29,9 @@ import (
 )
 
 // checkTorrentB is a benchmark-compatible version of checkTorrent.
+// Uses io.ReadFull into a pre-allocated buffer instead of io.ReadAll
+// to avoid per-piece allocations (io.ReadAll grows via append, allocating
+// multiple intermediate slices per 4MB piece).
 func checkTorrentB(b *testing.B, p *testPeer, namespace string, blob *core.BlobFixture) {
 	b.Helper()
 	require := require.New(b)
@@ -38,15 +41,15 @@ func checkTorrentB(b *testing.B, p *testPeer, namespace string, blob *core.BlobF
 	require.True(tor.Complete())
 
 	result := make([]byte, tor.Length())
-	cursor := result
+	var offset int64
 	for i := 0; i < tor.NumPieces(); i++ {
 		pr, err := tor.GetPieceReader(i)
 		require.NoError(err)
-		pieceData, err := io.ReadAll(pr)
+		pieceLen := tor.PieceLength(i)
+		_, err = io.ReadFull(pr, result[offset:offset+pieceLen])
 		require.NoError(err)
 		require.NoError(pr.Close())
-		copy(cursor, pieceData)
-		cursor = cursor[tor.PieceLength(i):]
+		offset += pieceLen
 	}
 	require.Equal(blob.Content, result)
 }
