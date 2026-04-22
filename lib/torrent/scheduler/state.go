@@ -24,7 +24,6 @@ import (
 	"github.com/uber/kraken/lib/torrent/scheduler/connstate"
 	"github.com/uber/kraken/lib/torrent/scheduler/dispatch"
 	"github.com/uber/kraken/lib/torrent/storage"
-	"go.uber.org/zap"
 
 	"github.com/willf/bitset"
 )
@@ -112,7 +111,7 @@ func (s *state) removeTorrent(h core.InfoHash, err error) {
 		}
 		s.sched.netevents.Produce(networkevent.TorrentCancelledEvent(h, s.sched.pctx.PeerID))
 		if err := s.sched.torrentArchive.DeleteTorrent(ctrl.dispatcher.Digest()); err != nil {
-			s.sched.log().Errorf("Error deleting torrent from archive: %s", err)
+			s.sched.logger.Errorf("Error deleting torrent from archive: %s", err)
 		}
 	}
 	delete(s.torrentControls, h)
@@ -162,6 +161,3 @@ func (s *state) addIncomingConn(
 	return nil
 }
 
-func (s *state) log(args ...interface{}) *zap.SugaredLogger {
-	return s.sched.log(args...)
-}
